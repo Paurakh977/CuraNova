@@ -27,7 +27,9 @@ import logging
 import os
 import warnings
 from pathlib import Path
+from typing import Literal
 
+import httpx
 import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -44,6 +46,9 @@ load_dotenv(Path(__file__).parent / ".env")
 
 # pylint: disable=wrong-import-position
 from google_search_agent.agent import agent, _SIGNAL_PREFIX  # noqa: E402
+
+# Google Search Signal Prefix
+_GOOGLE_SEARCH_PREFIX = "__GOOGLE_SEARCH__:"
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -220,25 +225,110 @@ async def analyze_proxy(websocket: WebSocket) -> None:
             pass
 
 
+# ── Helper: perform Google search ────────────────────────────────────────────
+
+async def perform_google_search(query: str) -> str:
+    """Perform a Google search using SerpAPI or fallback to DuckDuckGo.
+    
+    Returns formatted search results as a string.
+    """
+    logger.info(f"[GOOGLE_SEARCH] Performing search for: {query}")
+    
+    # Try SerpAPI if API key is available
+    serpapi_key = os.getenv("SERPAPI_API_KEY")
+    
+    if serpapi_key:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(
+                    "https://serpapi.com/search",
+                    params={
+                        "q": query,
+                        "api_key": serpapi_key,
+                        "engine": "google",
+                        "num": 5,
+                    }
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results = []
+                    for item in data.get("organic_results", [])[:5]:
+                        title = item.get("title", "")
+                        snippet = item.get("snippet", "")
+                        link = item.get("link", "")
+                        results.append(f"**{title}**\n{snippet}\n[Source]({link})")
+                    
+                    if results:
+                        return "\n\n".join(results)
+        except Exception as e:
+            logger.warning(f"[GOOGLE_SEARCH] SerpAPI failed: {e}")
+    
+    # Fallback to DuckDuckGo Instant Answer API (free, no key required)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                "https://api.duckduckgo.com/",
+                params={
+                    "q": query,
+                    "format": "json",
+                    "no_html": 1,
+                    "skip_disambig": 1,
+                }
+            )
+            if response.status_code == 200:
+                data = response.json()
+                results = []
+                
+                # Abstract (main answer)
+                if data.get("Abstract"):
+                    results.append(f"**Summary**\n{data['Abstract']}")
+                    if data.get("AbstractURL"):
+                        results.append(f"[Source]({data['AbstractURL']})")
+                
+                # Related topics
+                for topic in data.get("RelatedTopics", [])[:3]:
+                    if isinstance(topic, dict) and topic.get("Text"):
+                        results.append(f"• {topic['Text']}")
+                
+                if results:
+                    return "\n\n".join(results)
+    except Exception as e:
+        logger.warning(f"[GOOGLE_SEARCH] DuckDuckGo fallback failed: {e}")
+    
+    return f"I searched for '{query}' but couldn't retrieve results. Please try asking about the medicine directly."
+
+
 # ── Helper: extract signal payload from ADK events ───────────────────────────
 
-def _extract_signal(event_json: str) -> tuple[str | None, str]:
-    """Scan an ADK event JSON for a __MEDICAL_STREAM__ signal.
+SignalType = Literal["medical", "google_search", None]
+
+def _extract_signal(event_json: str) -> tuple[str | None, str, SignalType]:
+    """Scan an ADK event JSON for a __MEDICAL_STREAM__ or __GOOGLE_SEARCH__ signal.
 
     We use a multi-stage approach to ensure we never miss a signal:
       1. Structured search through content parts (text and functionResponse).
       2. If not found, a 'Nuclear' raw string scan of the entire JSON blob.
 
     Returns:
-        (signal_payload_json, cleaned_event_json)
+        (signal_payload_json, cleaned_event_json, signal_type)
     """
     try:
         event = json.loads(event_json)
     except json.JSONDecodeError:
-        return None, event_json
+        return None, event_json, None
 
     signal_payload: str | None = None
+    signal_type: SignalType = None
     modified = False
+
+    # Helper to detect which signal prefix is present
+    def find_signal_in_text(text: str) -> tuple[str | None, int, SignalType]:
+        """Returns (prefix, index, signal_type) if found, else (None, -1, None)"""
+        if _SIGNAL_PREFIX in text:
+            return _SIGNAL_PREFIX, text.index(_SIGNAL_PREFIX), "medical"
+        if _GOOGLE_SEARCH_PREFIX in text:
+            return _GOOGLE_SEARCH_PREFIX, text.index(_GOOGLE_SEARCH_PREFIX), "google_search"
+        return None, -1, None
 
     content = event.get("content") or {}
     parts = content.get("parts") or []
@@ -250,8 +340,9 @@ def _extract_signal(event_json: str) -> tuple[str | None, str]:
 
         # Check text
         text = part.get("text") or ""
-        if _SIGNAL_PREFIX in text:
-            prefix_idx = text.index(_SIGNAL_PREFIX)
+        prefix, prefix_idx, sig_type = find_signal_in_text(text)
+        
+        if prefix and prefix_idx >= 0:
             # Try to extract JSON payload carefully to preserve surrounding text
             raw_payload = text[prefix_idx + len(_SIGNAL_PREFIX):]
             json_start = raw_payload.find("{")
@@ -273,6 +364,7 @@ def _extract_signal(event_json: str) -> tuple[str | None, str]:
             
             if extracted_json:
                 signal_payload = extracted_json
+                signal_type = sig_type
                 # Reconstruct text without the signal part
                 text_before = text[:prefix_idx].strip()
                 text_after = raw_payload[extracted_end_idx:].strip()
@@ -283,16 +375,16 @@ def _extract_signal(event_json: str) -> tuple[str | None, str]:
                 
                 modified = True
                 found_in_this_part = True
-                logger.info(f"[SIGNAL] Found in text part. Payload: {signal_payload[:60]}")
+                logger.info(f"[SIGNAL:{sig_type}] Found in text part. Payload: {signal_payload[:60]}")
                 # Found signal in this part, no need to continue parsing this part
                 # break is not needed here as we use found_in_this_part flag
             
-            if not found_in_this_part and _SIGNAL_PREFIX in text:
+            if not found_in_this_part and prefix:
                 # Fallback: take everything after prefix if structured extraction fails
-                prefix_idx = text.index(_SIGNAL_PREFIX)
-                raw_payload = text[prefix_idx + len(_SIGNAL_PREFIX):]
+                raw_payload = text[prefix_idx + len(prefix):]
                 
                 signal_payload = raw_payload.strip()
+                signal_type = sig_type
                 cleaned_text = text[:prefix_idx].strip()
                 if cleaned_text:
                     new_parts.append({**part, "text": cleaned_text})
@@ -301,7 +393,7 @@ def _extract_signal(event_json: str) -> tuple[str | None, str]:
 
                 modified = True
                 found_in_this_part = True
-                logger.info(f"[SIGNAL] Found in text part (fallback). Payload starts: {signal_payload[:60]}")
+                logger.info(f"[SIGNAL:{sig_type}] Found in text part (fallback). Payload starts: {signal_payload[:60]}")
 
         # Check functionResponse
         if not found_in_this_part:
@@ -311,22 +403,26 @@ def _extract_signal(event_json: str) -> tuple[str | None, str]:
                 result = response_obj.get("result") or response_obj.get("output") or ""
                 
                 # Handle string result
-                if isinstance(result, str) and _SIGNAL_PREFIX in result:
-                    idx = result.index(_SIGNAL_PREFIX) + len(_SIGNAL_PREFIX)
-                    signal_payload = result[idx:].strip()
-                    modified = True
-                    found_in_this_part = True
-                    logger.info(f"[SIGNAL] Found in functionResponse (str). Payload starts: {signal_payload[:60]}")
+                if isinstance(result, str):
+                    r_prefix, r_idx, r_sig_type = find_signal_in_text(result)
+                    if r_prefix and r_idx >= 0:
+                        signal_payload = result[r_idx + len(r_prefix):].strip()
+                        signal_type = r_sig_type
+                        modified = True
+                        found_in_this_part = True
+                        logger.info(f"[SIGNAL:{r_sig_type}] Found in functionResponse (str). Payload starts: {signal_payload[:60]}")
                 
                 # Handle dict result
                 elif isinstance(result, dict):
                     inner = result.get("result") or result.get("output") or ""
-                    if isinstance(inner, str) and _SIGNAL_PREFIX in inner:
-                        idx = inner.index(_SIGNAL_PREFIX) + len(_SIGNAL_PREFIX)
-                        signal_payload = inner[idx:].strip()
-                        modified = True
-                        found_in_this_part = True
-                        logger.info(f"[SIGNAL] Found in functionResponse (dict). Payload starts: {signal_payload[:60]}")
+                    if isinstance(inner, str):
+                        i_prefix, i_idx, i_sig_type = find_signal_in_text(inner)
+                        if i_prefix and i_idx >= 0:
+                            signal_payload = inner[i_idx + len(i_prefix):].strip()
+                            signal_type = i_sig_type
+                            modified = True
+                            found_in_this_part = True
+                            logger.info(f"[SIGNAL:{i_sig_type}] Found in functionResponse (dict). Payload starts: {signal_payload[:60]}")
 
         if not found_in_this_part:
             new_parts.append(part)
@@ -338,32 +434,44 @@ def _extract_signal(event_json: str) -> tuple[str | None, str]:
         event["content"]["parts"] = new_parts
 
     # ── Stage 2: Nuclear Raw String Fallback ─────────────────────────────────
-    if not modified and _SIGNAL_PREFIX in event_json:
-        logger.warning("[SIGNAL] Nuclear fallback triggered! Signal found in raw JSON but not in expected parts.")
-        idx = event_json.index(_SIGNAL_PREFIX) + len(_SIGNAL_PREFIX)
-        # Try to grab the JSON payload by matching braces
-        raw_tail = event_json[idx:].strip()
-        if raw_tail.startswith("{"):
-            depth = 0
-            for i, ch in enumerate(raw_tail):
-                if ch == "{": depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        signal_payload = raw_tail[:i+1]
-                        break
+    if not modified:
+        # Check for either signal type in raw JSON
+        nuclear_prefix = None
+        nuclear_sig_type = None
+        if _SIGNAL_PREFIX in event_json:
+            nuclear_prefix = _SIGNAL_PREFIX
+            nuclear_sig_type = "medical"
+        elif _GOOGLE_SEARCH_PREFIX in event_json:
+            nuclear_prefix = _GOOGLE_SEARCH_PREFIX
+            nuclear_sig_type = "google_search"
         
-        # If we found a signal via fallback, we must 'clean' the event strictly
-        # so we don't leak logic to the UI. We'll return an empty event if it's messy.
-        if signal_payload:
-            modified = True
-            # Build a safe dummy event representing the turn's existence
-            event["content"] = {"parts": [{"text": ""}]} 
+        if nuclear_prefix:
+            logger.warning(f"[SIGNAL:{nuclear_sig_type}] Nuclear fallback triggered! Signal found in raw JSON but not in expected parts.")
+            idx = event_json.index(nuclear_prefix) + len(nuclear_prefix)
+            # Try to grab the JSON payload by matching braces
+            raw_tail = event_json[idx:].strip()
+            if raw_tail.startswith("{"):
+                depth = 0
+                for i, ch in enumerate(raw_tail):
+                    if ch == "{": depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            signal_payload = raw_tail[:i+1]
+                            signal_type = nuclear_sig_type
+                            break
+            
+            # If we found a signal via fallback, we must 'clean' the event strictly
+            # so we don't leak logic to the UI. We'll return an empty event if it's messy.
+            if signal_payload:
+                modified = True
+                # Build a safe dummy event representing the turn's existence
+                event["content"] = {"parts": [{"text": ""}]} 
 
     if modified:
-        return signal_payload, json.dumps(event)
+        return signal_payload, json.dumps(event), signal_type
 
-    return None, event_json
+    return None, event_json, None
 
 
 
@@ -616,11 +724,11 @@ async def websocket_endpoint(
                 # Log the full event at INFO so we can see tool responses in the console
                 logger.info(f"[ADK EVENT] {event_json[:500]}")
 
-                # Check for medical analysis signal embedded in tool output
-                signal_payload, clean_event_json = _extract_signal(event_json)
+                # Check for medical analysis signal or google search signal embedded in tool output
+                signal_payload, clean_event_json, signal_type = _extract_signal(event_json)
 
-                if signal_payload is not None:
-                    logger.info(f"[SIGNAL TRIGGER] payload: {signal_payload[:200]}")
+                if signal_payload is not None and signal_type is not None:
+                    logger.info(f"[SIGNAL TRIGGER:{signal_type}] payload: {signal_payload[:200]}")
                     # Safely parse the JSON payload (may have trailing text)
                     try:
                         payload_dict = json.loads(signal_payload)
@@ -643,13 +751,35 @@ async def websocket_endpoint(
                             await websocket.send_text(event_json)
                             continue
 
-                    # Forward the trigger to the client so it opens /ws/analyze
-                    await websocket.send_text(
-                        json.dumps({
-                            "medical_stream_trigger": True,
-                            "payload": payload_dict,
-                        })
-                    )
+                    if signal_type == "medical":
+                        # Forward the trigger to the client so it opens /ws/analyze
+                        await websocket.send_text(
+                            json.dumps({
+                                "medical_stream_trigger": True,
+                                "payload": payload_dict,
+                            })
+                        )
+                    elif signal_type == "google_search":
+                        # Perform Google search and send results back to client
+                        query = payload_dict.get("query", "")
+                        if query:
+                            logger.info(f"[GOOGLE_SEARCH] Executing search for: {query}")
+                            search_results = await perform_google_search(query)
+                            
+                            # Send search results as an assistant message
+                            await websocket.send_text(
+                                json.dumps({
+                                    "google_search_result": True,
+                                    "query": query,
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [{"text": f"**Search Results for: {query}**\n\n{search_results}\n\n*Disclaimer: This information is for reference only. Always consult a healthcare professional for medical advice.*"}]
+                                    }
+                                })
+                            )
+                        else:
+                            logger.warning("[GOOGLE_SEARCH] No query found in payload")
+                    
                     # Also forward the cleaned agent event (e.g. "processing…" text)
                     # Only if it still has meaningful content
                     cleaned = json.loads(clean_event_json) if clean_event_json else {}
